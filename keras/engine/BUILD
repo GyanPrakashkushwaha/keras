@@ -1,6 +1,8 @@
 # Description:
 #   Contains the Keras engine API (internal TensorFlow version).
 
+# Placeholder: load unaliased py_library
+
 # buildifier: disable=same-origin-load
 load("@org_keras//keras:keras.bzl", "tf_py_test")
 
@@ -8,6 +10,7 @@ load("@org_keras//keras:keras.bzl", "tf_py_test")
 load("@org_keras//keras:keras.bzl", "cuda_py_test")
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//keras:license"],
     # TODO(scottzhu): Remove non-keras deps from TF.
     default_visibility = ["//keras:friends"],
     licenses = ["notice"],
@@ -66,6 +69,7 @@ py_library(
         "//keras/utils:engine_utils",
         "//keras/utils:metrics_utils",
         "//keras/utils:mode_keys",
+        "//keras/utils:steps_per_execution_tuning",
         "//keras/utils:tf_utils",
         "//keras/utils:version_utils",
     ],

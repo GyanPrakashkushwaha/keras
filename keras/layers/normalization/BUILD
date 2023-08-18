@@ -1,6 +1,8 @@
 # Description:
 #   Contains the Keras normalization layers (internal TensorFlow version).
 
+# Placeholder: load unaliased py_library
+
 # buildifier: disable=same-origin-load
 load("@org_keras//keras:keras.bzl", "cuda_py_test")
 
@@ -8,6 +10,7 @@ load("@org_keras//keras:keras.bzl", "cuda_py_test")
 load("@org_keras//keras:keras.bzl", "tf_py_test")
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//keras:license"],
     # TODO(scottzhu): Remove non-keras deps from TF.
     default_visibility = ["//keras:friends"],
     licenses = ["notice"],

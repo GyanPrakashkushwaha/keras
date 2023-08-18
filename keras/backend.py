@@ -1087,9 +1087,7 @@ def name_scope(name):
 
 # Export V1 version.
 _v1_name_scope = tf.compat.v1.name_scope
-keras_export(v1=["keras.backend.name_scope"], allow_multiple_exports=True)(
-    _v1_name_scope
-)
+keras_export(v1=["keras.backend.name_scope"])(_v1_name_scope)
 
 
 @keras_export("keras.backend.variable")
@@ -5441,7 +5439,22 @@ def softmax(x, axis=-1):
     Returns:
         A tensor.
     """
-    return tf.nn.softmax(x, axis=axis)
+    if x.shape.rank <= 1:
+        raise ValueError(
+            f"Cannot apply softmax to a tensor that is 1D. Received input: {x}"
+        )
+
+    if isinstance(axis, int):
+        output = tf.nn.softmax(x, axis=axis)
+    else:
+        # nn.softmax does not support tuple axis.
+        numerator = tf.exp(x - tf.reduce_max(x, axis=axis, keepdims=True))
+        denominator = tf.reduce_sum(numerator, axis=axis, keepdims=True)
+        output = numerator / denominator
+
+    # Cache the logits to use for crossentropy loss.
+    output._keras_logits = x
+    return output
 
 
 @keras_export("keras.backend.softplus")
@@ -5899,7 +5912,10 @@ def sigmoid(x):
     Returns:
         A tensor.
     """
-    return tf.math.sigmoid(x)
+    output = tf.sigmoid(x)
+    # Cache the logits to use for crossentropy loss.
+    output._keras_logits = x
+    return output
 
 
 @keras_export("keras.backend.hard_sigmoid")

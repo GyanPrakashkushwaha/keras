@@ -22,6 +22,12 @@ import weakref
 
 import numpy as np
 import tensorflow.compat.v2 as tf
+from tensorflow.python.distribute import distribute_utils
+from tensorflow.python.distribute import input_ops
+from tensorflow.python.eager import context
+from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.util.tf_export import keras_export
+from tensorflow.tools.docs import doc_controls
 
 from keras import backend
 from keras import callbacks as callbacks_module
@@ -48,19 +54,12 @@ from keras.saving.legacy.saved_model import model_serialization
 from keras.utils import generic_utils
 from keras.utils import io_utils
 from keras.utils import layer_utils
+from keras.utils import steps_per_execution_tuning
 from keras.utils import tf_inspect
 from keras.utils import tf_utils
 from keras.utils import traceback_utils
 from keras.utils import version_utils
 from keras.utils.mode_keys import ModeKeys
-
-# isort: off
-from tensorflow.python.eager import context
-from tensorflow.python.platform import tf_logging as logging
-from tensorflow.python.util.tf_export import keras_export
-from tensorflow.python.distribute import distribute_utils
-from tensorflow.python.distribute import input_ops
-from tensorflow.tools.docs import doc_controls
 
 try:
     import h5py
@@ -182,6 +181,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 "_test_counter",
                 "_predict_counter",
                 "_steps_per_execution",
+                "_compiled_trainable_state",
             ),
             base_layer.Layer._TF_MODULE_IGNORED_PROPERTIES,
         )
@@ -320,6 +320,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         self._checkpoint = tf.train.Checkpoint(root=weakref.ref(self))
 
         self._steps_per_execution = None
+        self._steps_per_execution_tuner = None
+        self._autotune_steps_per_execution = False
 
         self._layout_map = layout_map_lib.get_current_layout_map()
 
@@ -706,16 +708,19 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
               `run_eagerly=True` is not supported when using
               `tf.distribute.experimental.ParameterServerStrategy`. Defaults to
                `False`.
-            steps_per_execution: Int. The number of batches to
-              run during each `tf.function` call. Running multiple batches
-              inside a single `tf.function` call can greatly improve performance
-              on TPUs or small models with a large Python overhead. At most, one
-              full epoch will be run each execution. If a number larger than the
-              size of the epoch is passed, the execution will be truncated to
-              the size of the epoch. Note that if `steps_per_execution` is set
-              to `N`, `Callback.on_batch_begin` and `Callback.on_batch_end`
-              methods will only be called every `N` batches (i.e. before/after
-              each `tf.function` execution). Defaults to `1`.
+            steps_per_execution: Int or `'auto'`. The number of batches to
+              run during each `tf.function` call. If set to "auto", keras will
+              automatically tune `steps_per_execution` during runtime. Running
+              multiple batches inside a single `tf.function` call can greatly
+              improve performance on TPUs, when used with distributed strategies
+              such as `ParameterServerStrategy`, or with small models with a
+              large Python overhead. At most, one full epoch will be run each
+              execution. If a number larger than the size of the epoch is
+              passed, the execution will be truncated to the size of the epoch.
+              Note that if `steps_per_execution` is set to `N`,
+              `Callback.on_batch_begin` and `Callback.on_batch_end` methods will
+              only be called every `N` batches (i.e. before/after each
+              `tf.function` execution). Defaults to `1`.
             jit_compile: If `True`, compile the model training step with XLA.
               [XLA](https://www.tensorflow.org/xla) is an optimizing compiler
               for machine learning.
@@ -799,7 +804,17 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 mesh=mesh,
             )
 
-            self._configure_steps_per_execution(steps_per_execution or 1)
+            if steps_per_execution == "auto":
+                if self._steps_per_execution is None:
+                    self._configure_steps_per_execution(1)
+                self._steps_per_execution_tuner = (
+                    steps_per_execution_tuning.StepsPerExecutionTuner(
+                        self.optimizer, self._steps_per_execution
+                    )
+                )
+                self._autotune_steps_per_execution = True
+            else:
+                self._configure_steps_per_execution(steps_per_execution or 1)
 
             self._pss_evaluation_shards = self._infer_exact_eval_shards(
                 pss_evaluation_shards
@@ -993,6 +1008,35 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     @run_eagerly.setter
     def run_eagerly(self, value):
         self._run_eagerly = value
+
+    @property
+    def autotune_steps_per_execution(self):
+        """Settable property to enable tuning for steps_per_execution"""
+        return self._autotune_steps_per_execution
+
+    @autotune_steps_per_execution.setter
+    def autotune_steps_per_execution(self, value):
+        self._autotune_steps_per_execution = value
+        if value and self._steps_per_execution_tuner is None:
+            if self._steps_per_execution is None:
+                self._configure_steps_per_execution(1)
+            self._steps_per_execution_tuner = (
+                steps_per_execution_tuning.StepsPerExecutionTuner(
+                    self.optimizer, self._steps_per_execution
+                )
+            )
+
+    @property
+    def steps_per_execution(self):
+        """Settable `steps_per_execution variable. Requires a compiled model."""
+        return self._steps_per_execution
+
+    @steps_per_execution.setter
+    def steps_per_execution(self, value):
+        if self._steps_per_execution is None:
+            self._configure_steps_per_execution(value)
+        else:
+            self._steps_per_execution.assign(value)
 
     @property
     def jit_compile(self):
@@ -1332,15 +1376,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                     model._train_counter.assign_add(1)
                 return outputs
 
-            if self.jit_compile and not isinstance(
-                model.distribute_strategy,
-                (
-                    tf.compat.v1.distribute.experimental.TPUStrategy,
-                    tf.distribute.TPUStrategy,
-                ),
-            ):
-                # TODO(b/258249546): Explicit `jit_compile=True` on TPU causes
-                # unexpected behavior, so we skip TPU training now.
+            if self.jit_compile:
                 run_step = tf.function(
                     run_step, jit_compile=True, reduce_retracing=True
                 )
@@ -1357,6 +1393,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         if (
             self._steps_per_execution is None
             or self._steps_per_execution.numpy().item() == 1
+            and not self.autotune_steps_per_execution
         ):
 
             def train_function(iterator):
@@ -1624,7 +1661,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 `keras.utils.Sequence` input only. If `True`, use process-based
                 threading. If unspecified, `use_multiprocessing` will default to
                 `False`. Note that because this implementation relies on
-                multiprocessing, you should not pass non-picklable arguments to
+                multiprocessing, you should not pass non-pickleable arguments to
                 the generator as they can't be passed easily to children
                 processes.
 
@@ -1739,6 +1776,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             self._train_counter.assign(0)
             callbacks.on_train_begin()
             training_logs = None
+            if self.autotune_steps_per_execution:
+                self._steps_per_execution_tuner.start()
             # Handle fault-tolerance for multi-worker.
             # TODO(omalleyt): Fix the ordering issues that mean this has to
             # happen after `callbacks.on_train_begin`.
@@ -1845,6 +1884,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             # If eval data_handler exists, delete it after all epochs are done.
             if getattr(self, "_eval_data_handler", None) is not None:
                 del self._eval_data_handler
+            if self.autotune_steps_per_execution:
+                self._steps_per_execution_tuner.stop()
             callbacks.on_train_end(logs=training_logs)
             return self.history
 
@@ -2017,6 +2058,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         if (
             self._steps_per_execution is None
             or self._steps_per_execution.numpy().item() == 1
+            and not self.autotune_steps_per_execution
         ):
 
             def test_function(iterator):
@@ -2154,7 +2196,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
               `keras.utils.Sequence` input only. If `True`, use process-based
               threading. If unspecified, `use_multiprocessing` will default to
               `False`. Note that because this implementation relies on
-              multiprocessing, you should not pass non-picklable arguments to
+              multiprocessing, you should not pass non-pickleable arguments to
               the generator as they can't be passed easily to children
               processes.
             return_dict: If `True`, loss and metric results are returned as a
@@ -2238,6 +2280,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             test_function_runner = self._get_test_function_runner(callbacks)
             self._test_counter.assign(0)
             callbacks.on_test_begin()
+            if self.autotune_steps_per_execution:
+                self._steps_per_execution_tuner.start()
             for (
                 _,
                 dataset_or_iterator,
@@ -2262,6 +2306,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 logs = self._aggregate_exact_metrics(logs)
             else:
                 logs = self._validate_and_get_metrics_result(logs)
+            if self.autotune_steps_per_execution:
+                self._steps_per_execution_tuner.stop()
             callbacks.on_test_end(logs=logs)
 
             if return_dict:
@@ -2386,6 +2432,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         if (
             self._steps_per_execution is None
             or self._steps_per_execution.numpy().item() == 1
+            and not self.autotune_steps_per_execution
         ):
 
             def predict_function(iterator):
@@ -2507,7 +2554,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 `keras.utils.Sequence` input only. If `True`, use process-based
                 threading. If unspecified, `use_multiprocessing` will default to
                 `False`. Note that because this implementation relies on
-                multiprocessing, you should not pass non-picklable arguments to
+                multiprocessing, you should not pass non-pickleable arguments to
                 the generator as they can't be passed easily to children
                 processes.
 
@@ -2598,6 +2645,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             self.predict_function = self.make_predict_function()
             self._predict_counter.assign(0)
             callbacks.on_predict_begin()
+            if self.autotune_steps_per_execution:
+                self._steps_per_execution_tuner.start()
             batch_outputs = None
             for _, iterator in data_handler.enumerate_epochs():  # Single epoch.
                 with data_handler.catch_stop_iteration():
@@ -2636,6 +2685,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                     "information of where went wrong, or file a "
                     "issue/bug to `tf.keras`."
                 )
+            if self.autotune_steps_per_execution:
+                self._steps_per_execution_tuner.stop()
             callbacks.on_predict_end()
         all_outputs = tf.__internal__.nest.map_structure_up_to(
             batch_outputs, potentially_ragged_concat, outputs

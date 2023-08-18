@@ -1113,7 +1113,6 @@ class Layer(tf.Module, version_utils.LayerVersionSelector):
             build_graph=not eager,
             training=training_mode,
         ):
-
             input_spec.assert_input_compatibility(
                 self.input_spec, inputs, self.name
             )
@@ -2862,7 +2861,9 @@ class Layer(tf.Module, version_utils.LayerVersionSelector):
                         tf.shape(output)[0], activity_loss.dtype
                     )
                     # Make activity regularization strength batch-agnostic.
-                    mean_activity_loss = activity_loss / batch_size
+                    mean_activity_loss = tf.math.divide_no_nan(
+                        activity_loss, batch_size
+                    )
                     self.add_loss(mean_activity_loss)
 
     def _set_mask_metadata(self, inputs, outputs, previous_mask, build_graph):
@@ -3834,11 +3835,13 @@ class BaseRandomLayer(Layer):
         children.update(super()._trackable_children(save_type, **kwargs))
         return children
 
-    def _lookup_dependency(self, name):
+    def _lookup_dependency(self, name, cached_dependencies=None):
         # When loading from a Keras SavedModel load, make sure that the loader
         # can find the random generator, otherwise the loader will assume that
         # it does not exist, and will try to create a new generator.
         if name == "_random_generator":
             return self._random_generator
+        elif cached_dependencies is not None:
+            return cached_dependencies.get(name)
         else:
             return super()._lookup_dependency(name)
